@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Solar System Simulator</title>
+<style>
+:root{--bg:#05070d;--panel:rgba(18,24,38,.88);--ink:#e8edf6;--mut:#8f9bb3;--acc:#ffb84d;--bd:#2b3752;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+html,body{height:100%;margin:0;overflow:hidden;background:var(--bg);color:var(--ink);font:14px system-ui,-apple-system,Segoe UI,sans-serif}
+canvas{display:block;width:100%;height:100%;touch-action:none}
+.hud{position:fixed;background:var(--panel);border:1px solid var(--bd);border-radius:12px;padding:8px 10px;backdrop-filter:blur(8px);font-size:12px;pointer-events:none}
+#info{top:calc(8px + env(safe-area-inset-top,0px));left:8px;min-width:150px;display:none;line-height:1.5}
+#info b{font-size:14px;color:var(--acc)}
+#time{top:calc(8px + env(safe-area-inset-top,0px));right:8px;text-align:right;color:var(--mut)}
+#hint{top:calc(54px + env(safe-area-inset-top,0px));left:50%;transform:translateX(-50%);display:none;color:var(--acc);white-space:nowrap}
+#bar{position:fixed;left:8px;right:8px;bottom:calc(8px + env(safe-area-inset-bottom,0px));max-width:560px;margin:auto;background:var(--panel);border:1px solid var(--bd);border-radius:14px;padding:8px;backdrop-filter:blur(8px)}
+.row{display:flex;gap:6px;flex-wrap:wrap}
+button,select{flex:1;min-width:52px;padding:9px 6px;border:1px solid var(--bd);border-radius:10px;background:transparent;color:var(--ink);font:inherit;font-weight:600;cursor:pointer}
+select option{background:#121826}
+button.on{background:var(--acc);color:#111;border-color:var(--acc)}
+.sl{display:flex;align-items:center;gap:8px;margin-top:7px}
+.sl label{width:84px;color:var(--mut)}.sl input{flex:1;accent-color:var(--acc)}.sl output{width:70px;text-align:right;font-variant-numeric:tabular-nums;font-size:12px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hud" id="info"></div>
+<div class="hud" id="time"></div>
+<div class="hud" id="hint">Drag to launch a new body</div>
+<div id="bar">
+  <div class="row">
+    <button id="play" class="on">⏸ Pause</button>
+    <button id="trails" class="on">Trails</button>
+    <button id="view">View: Inner</button>
+    <button id="reset">Reset</button>
+  </div>
+  <div class="row" style="margin-top:6px">
+    <button id="add">+ Add body</button>
+    <select id="am"><option value="3e-6">Earth-mass</option><option value="1e-3">Jupiter-mass</option><option value="0.4">Star (0.4 M☉)</option></select>
+  </div>
+  <div class="sl"><label>Time speed</label><input id="sp" type="range" min="0" max="100" value="52"><output id="spo"></output></div>
+  <div class="sl"><label>Sun mass</label><input id="sm" type="range" min="0.2" max="3" step="0.05" value="1"><output id="smo">1.00 M☉</output></div>
+</div>
+<script>
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const $=id=>document.getElementById(id);
+const G=4*Math.PI*Math.PI;           // AU^3 / (Msun yr^2)
+const DT=0.002, TRAIL_MAX=2500, TRAIL_EVERY=8, KMS=4.74047; // AU/yr -> km/s
+let W=0,H=0,dpr=1;
+function resize(){dpr=Math.min(devicePixelRatio||1,2);W=innerWidth;H=innerHeight;cv.width=W*dpr;cv.height=H*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);makeStars();}
+const PL=[ // name, a(AU), mass(Msun), px radius, color
+ ['Mercury',.387,1.66e-7,2.5,'#b5b0a8'],['Venus',.723,2.45e-6,4,'#e8cda0'],['Earth',1,3.0e-6,4.5,'#4f9dff'],
+ ['Mars',1.524,3.2e-7,3.5,'#e0643c'],['Jupiter',5.203,9.55e-4,9,'#d9b38c'],['Saturn',9.537,2.86e-4,8,'#e6d29a'],
+ ['Uranus',19.19,4.4e-5,6,'#8fe3e8'],['Neptune',30.07,5.15e-5,6,'#4a6cf0']];
+let bodies=[],T=0,stepCount=0,sel=null,follow=false,showTrails=true,paused=false,addMode=false;
+let cx=0,cy=0,scale=100,viewIdx=0;
+function init(){
+  bodies=[{name:'Sun',m:1,x:0,y:0,vx:0,vy:0,r:9,color:'#ffd35c',trail:[],sun:true}];
+  PL.forEach(([n,a,m,r,c],i)=>{const th=i*2.399+.5,v=2*Math.PI/Math.sqrt(a);
+    bodies.push({name:n,m,x:a*Math.cos(th),y:a*Math.sin(th),vx:-v*Math.sin(th),vy:v*Math.cos(th),r,color:c,trail:[]});});
+  T=0;stepCount=0;sel=null;follow=false;
+  $('sm').value=1;$('smo').textContent='1.00 M☉';setView(0);
+}
+const VIEWS=[['Inner',1.8],['Jupiter',6.5],['Outer',34]];
+function setView(i){viewIdx=i;cx=0;cy=0;follow=false;scale=Math.min(W,H)*.5/VIEWS[i][1];$('view').textContent='View: '+VIEWS[i][0];}
+
+// physics: kick-drift-kick leapfrog
+let ax=[],ay=[];
+function accel(){
+  const n=bodies.length;ax.length=ay.length=n;ax.fill(0);ay.fill(0);
+  for(let i=0;i<n;i++){const a=bodies[i];
+    for(let j=i+1;j<n;j++){const b=bodies[j];
+      const dx=b.x-a.x,dy=b.y-a.y,d2=dx*dx+dy*dy+1e-6,inv=G/(d2*Math.sqrt(d2));
+      ax[i]+=dx*inv*b.m;ay[i]+=dy*inv*b.m;ax[j]-=dx*inv*a.m;ay[j]-=dy*inv*a.m;}}
+}
+function step(){
+  accel();
+  for(let i=0;i<bodies.length;i++){const b=bodies[i];b.vx+=ax[i]*DT/2;b.vy+=ay[i]*DT/2;b.x+=b.vx*DT;b.y+=b.vy*DT;}
+  accel();
+  for(let i=0;i<bodies.length;i++){const b=bodies[i];b.vx+=ax[i]*DT/2;b.vy+=ay[i]*DT/2;}
+  T+=DT;stepCount++;
+  if(stepCount%TRAIL_EVERY===0)for(const b of bodies){b.trail.push(b.x,b.y);if(b.trail.length>TRAIL_MAX*2)b.trail.splice(0,2);}
+  // absorb into the sun / eject
+  const s=bodies[0];
+  for(let i=bodies.length-1;i>0;i--){const b=bodies[i],dx=b.x-s.x,dy=b.y-s.y,d=Math.hypot(dx,dy);
+    if(d<.04||d>300){if(sel===b){sel=null;follow=false;}bodies.splice(i,1);}}
+}
+const speed=()=>0.01*Math.pow(500,$('sp').value/100);
+
+// camera helpers
+const sx=x=>W/2+(x-cx)*scale, sy=y=>H/2-(y-cy)*scale;
+const wx=px=>cx+(px-W/2)/scale, wy=py=>cy-(py-H/2)/scale;
+function zoomAt(f,px,py){const x=wx(px),y=wy(py);scale=Math.min(4000,Math.max(2,scale*f));cx=x-(px-W/2)/scale;cy=y+(py-H/2)/scale;}
+
+// stars
+let stars=[];
+function makeStars(){stars=[];for(let i=0;i<140;i++)stars.push([Math.random()*W,Math.random()*H,Math.random()*1.2+.2,Math.random()*.6+.2]);}
+
+function draw(){
+  ctx.fillStyle='#05070d';ctx.fillRect(0,0,W,H);
+  for(const [x,y,r,a] of stars){ctx.fillStyle=`rgba(255,255,255,${a})`;ctx.fillRect(x,y,r,r);}
+  if(follow&&sel){cx=sel.x;cy=sel.y;}
+  if(showTrails){ctx.lineWidth=1;
+    for(const b of bodies){const t=b.trail;if(t.length<4||b.sun)continue;
+      ctx.strokeStyle=b.color;ctx.globalAlpha=.4;ctx.beginPath();ctx.moveTo(sx(t[0]),sy(t[1]));
+      for(let i=2;i<t.length;i+=2)ctx.lineTo(sx(t[i]),sy(t[i+1]));ctx.lineTo(sx(b.x),sy(b.y));ctx.stroke();}
+    ctx.globalAlpha=1;}
+  for(const b of bodies){const x=sx(b.x),y=sy(b.y);
+    if(x<-60||x>W+60||y<-60||y>H+60)continue;
+    let r=b.r;
+    if(b.sun){r=9*Math.cbrt(b.m);const gr=ctx.createRadialGradient(x,y,r*.5,x,y,r*4);
+      gr.addColorStop(0,'rgba(255,200,90,.55)');gr.addColorStop(1,'rgba(255,160,40,0)');ctx.fillStyle=gr;ctx.beginPath();ctx.arc(x,y,r*4,0,7);ctx.fill();}
+    ctx.fillStyle=b.color;ctx.beginPath();ctx.arc(x,y,r,0,7);ctx.fill();
+    if(b.name==='Saturn'){ctx.strokeStyle='rgba(230,210,150,.8)';ctx.beginPath();ctx.ellipse(x,y,r*1.9,r*.6,-.4,0,7);ctx.stroke();}
+    if(b===sel){ctx.strokeStyle='#fff';ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(x,y,r+5,0,7);ctx.stroke();ctx.lineWidth=1;}
+    if(b.name&&!b.sun){ctx.fillStyle='rgba(232,237,246,.7)';ctx.font='11px system-ui';ctx.fillText(b.name,x+r+4,y-r);}
+  }
+  if(aim){ctx.strokeStyle='#ffb84d';ctx.lineWidth=2;ctx.setLineDash([6,4]);ctx.beginPath();ctx.moveTo(sx(aim.x0),sy(aim.y0));ctx.lineTo(sx(aim.x1),sy(aim.y1));ctx.stroke();ctx.setLineDash([]);
+    ctx.fillStyle='#ffb84d';ctx.beginPath();ctx.arc(sx(aim.x0),sy(aim.y0),4,0,7);ctx.fill();}
+  // HUD
+  const yrs=T;$('time').innerHTML=`Year ${yrs.toFixed(2)}<br>${bodies.length} bodies`;
+  $('spo').textContent=speed()<1?(speed()*365.25).toFixed(0)+' d/s':speed().toFixed(2)+' yr/s';
+  const inf=$('info');
+  if(sel){const d=Math.hypot(sel.x-bodies[0].x,sel.y-bodies[0].y),v=Math.hypot(sel.vx,sel.vy)*KMS;
+    inf.style.display='block';inf.innerHTML=`<b>${sel.name}</b><br>Distance: ${d.toFixed(2)} AU<br>Speed: ${v.toFixed(1)} km/s<br>Mass: ${sel.m.toExponential(1)} M☉`;}
+  else inf.style.display='none';
+}
+
+let last=performance.now();
+function loop(t){
+  requestAnimationFrame(loop);
+  const dt=Math.min((t-last)/1000,.05);last=t;
+  if(!paused){bodies[0].m=+$('sm').value;
+    const n=Math.min(500,Math.round(speed()*dt/DT));for(let i=0;i<n;i++)step();}
+  draw();
+}
+
+// input
+const pts=new Map();let moved=0,pinchD=0,aim=null,downPos=null;
+function hit(px,py){let best=null,bd=22;for(const b of bodies){const d=Math.hypot(sx(b.x)-px,sy(b.y)-py);if(d<bd){bd=d;best=b;}}return best;}
+cv.addEventListener('pointerdown',e=>{
+  cv.setPointerCapture(e.pointerId);pts.set(e.pointerId,{x:e.clientX,y:e.clientY});moved=0;downPos={x:e.clientX,y:e.clientY};
+  if(pts.size===2){const [a,b]=[...pts.values()];pinchD=Math.hypot(a.x-b.x,a.y-b.y);aim=null;return;}
+  if(addMode){aim={x0:wx(e.clientX),y0:wy(e.clientY),x1:wx(e.clientX),y1:wy(e.clientY)};}
+});
+cv.addEventListener('pointermove',e=>{
+  const p=pts.get(e.pointerId);if(!p)return;
+  const dx=e.clientX-p.x,dy=e.clientY-p.y;p.x=e.clientX;p.y=e.clientY;moved+=Math.abs(dx)+Math.abs(dy);
+  if(pts.size===2){const [a,b]=[...pts.values()];const d=Math.hypot(a.x-b.x,a.y-b.y);zoomAt(d/pinchD,(a.x+b.x)/2,(a.y+b.y)/2);pinchD=d;return;}
+  if(aim){aim.x1=wx(e.clientX);aim.y1=wy(e.clientY);return;}
+  if(!addMode){cx-=dx/scale;cy+=dy/scale;if(moved>6)follow=false;}
+});
+function up(e){
+  if(!pts.has(e.pointerId))return;pts.delete(e.pointerId);
+  if(aim){const m=+$('am').value;
+    bodies.push({name:m>=.1?'Star':m>1e-4?'Gas giant':'Planet',m,x:aim.x0,y:aim.y0,vx:(aim.x1-aim.x0)*4,vy:(aim.y1-aim.y0)*4,r:m>=.1?7:m>1e-4?6:3.5,color:`hsl(${Math.random()*360},70%,65%)`,trail:[]});
+    aim=null;return;}
+  if(!pts.size&&moved<8&&!addMode){const b=hit(e.clientX,e.clientY);sel=b;follow=!!b&&!b.sun;}
+}
+cv.addEventListener('pointerup',up);cv.addEventListener('pointercancel',up);
+cv.addEventListener('wheel',e=>{e.preventDefault();zoomAt(Math.exp(-e.deltaY*.001),e.clientX,e.clientY);},{passive:false});
+
+$('play').onclick=()=>{paused=!paused;$('play').textContent=paused?'▶ Play':'⏸ Pause';$('play').classList.toggle('on',!paused);};
+$('trails').onclick=()=>{showTrails=!showTrails;$('trails').classList.toggle('on',showTrails);};
+$('view').onclick=()=>setView((viewIdx+1)%VIEWS.length);
+$('reset').onclick=()=>init();
+$('add').onclick=()=>{addMode=!addMode;$('add').classList.toggle('on',addMode);$('hint').style.display=addMode?'block':'none';};
+$('sm').oninput=()=>{$('smo').textContent=(+$('sm').value).toFixed(2)+' M☉';};
+addEventListener('resize',()=>{resize();});
+resize();init();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
